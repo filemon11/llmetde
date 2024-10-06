@@ -1,5 +1,5 @@
 from transformers import GPT2LMHeadModel
-from distances import Distance
+from distances import Distance, CosineSimilarity
 from data import Batch, DataLoader
 import torch
 import torch.nn as nn
@@ -15,17 +15,6 @@ def generate_embeds(input : torch.Tensor, model : GPT2LMHeadModel) -> tuple[torc
     hidden_states = model(input, output_hidden_states = True).hidden_states
     return hidden_states[0], hidden_states[-1]
 
-class DistanceRegressionModel(nn.Module):
-    def __init__(self, out_dim : int, distance : Distance):
-        super().__init__()
-
-        self.linear : nn.Linear = nn.Linear(1, out_dim, bias = True)
-
-        self.distance : Distance = distance
-
-    def forward(self, x_1 : torch.Tensor, x_2 : torch.Tensor) -> torch.Tensor:
-        distance_result : torch.Tensor = self.distance(x_1, x_2).unsqueeze(-1)
-        return self.linear(distance_result)
     
 class GPTDistanceRegression():
     def __init__(self, out_dim : int, 
@@ -33,16 +22,21 @@ class GPTDistanceRegression():
                  optimiser_params : dict = {},
                  training_params : dict = {}):
         
+        self.invert : bool = not isinstance(distance, CosineSimilarity)
+
         self.gpt : GPT2LMHeadModel = get_gpt_model()
-        self.distance_regression : DistanceRegressionModel = DistanceRegressionModel(out_dim, distance)
+        self.distance : Distance = distance
+        self.linear : nn.Linear = nn.Linear(1, out_dim, bias = True)
 
         self.loss : nn.MSELoss = nn.MSELoss()
         #TODO ensure that GPT model is frozen
 
-        self.optimiser : optim.SGD = optim.SGD(self.distance_regression.parameters(), **optimiser_params)
+        self.optimiser : optim.SGD = optim.SGD(list(self.distance.parameters()) + 
+                                               list(self.linear.parameters()), **optimiser_params)
 
         self.gpt.to(training_params["device"])
-        self.distance_regression.to(training_params["device"])
+        self.distance.to(training_params["device"])
+        self.linear.to(training_params["device"])
         self.training_params : dict = training_params
 
     def train(self, y_names : list[str],
@@ -131,12 +125,18 @@ class GPTDistanceRegression():
 
             i = torch.cat((sentence_in[1:].unsqueeze(0), i), dim = 0)
 
-            distances = self.distance_regression(i, o)
+            distances = self.distance(i, o)
+
+            if self.invert:
+                distances = 1 / distances
+
             distances = torch.nn.functional.softmax(distances, dim = 0)
+            
+            distances = distances[0].unsqueeze(-1)
 
-            distances = distances[0]
+            distances = self.linear(-torch.log(distances))
 
-            preds.append(distances.squeeze(-1))
+            preds.append(distances)
 
         return preds
     
