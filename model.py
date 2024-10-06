@@ -1,5 +1,5 @@
 from transformers import GPT2LMHeadModel
-from distances import Distance, CosineSimilarity
+from distances import Distance, CosineSimilarity, BilinearDistance
 from data import Batch, DataLoader
 import torch
 import torch.nn as nn
@@ -22,7 +22,7 @@ class GPTDistanceRegression():
                  optimiser_params : dict = {},
                  training_params : dict = {}):
         
-        self.invert : bool = not isinstance(distance, CosineSimilarity)
+        self.invert : bool = not isinstance(distance, CosineSimilarity) and not isinstance(distance, BilinearDistance)
 
         self.gpt : GPT2LMHeadModel = get_gpt_model()
         self.distance : Distance = distance
@@ -112,31 +112,61 @@ class GPTDistanceRegression():
     def eval():
         raise NotImplementedError
     
-    def calculate_distances(self, word_gpt_in : list[torch.Tensor], word_gpt_out : list[torch.Tensor]) -> list[torch.Tensor]:
+    def calculate_distances(self, gpt_in_embeds : list[torch.Tensor], 
+                            gpt_out_embeds : list[torch.Tensor],
+                            word2tokenidxs : list[list[int]]) -> list[torch.Tensor]:
+
+        word_gpt_in : list[torch.Tensor] = []
+        word_gpt_out : list[torch.Tensor] = []
+        for sen_gpt_in, sen_gpt_out, sen_map in zip(gpt_in_embeds, gpt_out_embeds, word2tokenidxs):
+            sen_word_gpt_in : list[torch.Tensor] = [sen_gpt_in[0]]
+            sen_word_gpt_out : list[torch.Tensor] = [sen_gpt_out[0]]
+            for word in sen_map:
+                sen_word_gpt_in.append(torch.mean(sen_gpt_in[word], dim = 0))
+                sen_word_gpt_out.append(torch.mean(sen_gpt_out[word], dim = 0))
+            
+            word_gpt_in.append(torch.stack(sen_word_gpt_in))
+            word_gpt_out.append(torch.stack(sen_word_gpt_out))
+
         preds : list[torch.Tensor] = []
 
         for sentence_in, sentence_out in zip(word_gpt_in, word_gpt_out):
-            embeddings = self.gpt.transformer.wte.weight
+            embeddings = self.gpt.transformer.wte.weight        # One could delete those embeddings that correspond to tokens that occur in the gold word
             vocab_size = embeddings.shape[0]
 
-            o = sentence_out[:-1].unsqueeze(0).expand(vocab_size+1, *sentence_out[:-1].shape)
+            #o = sentence_out[:-1].unsqueeze(0).expand(vocab_size+1, *sentence_out[:-1].shape)
 
-            i = embeddings.unsqueeze(1).expand(embeddings.shape[0], *sentence_out[:-1].shape)
+            #i = embeddings.unsqueeze(1).expand(embeddings.shape[0], *sentence_out[:-1].shape)
 
-            i = torch.cat((sentence_in[1:].unsqueeze(0), i), dim = 0)
+            distances : list[torch.Tensor] = []
+            for word_o, word_i, w2t in zip(sentence_out[:-1], sentence_in[1:], word2tokenidxs):
+                # Includes mean vector for multi-token words
 
-            distances = self.distance(i, o)
+                i : torch.Tensor = embeddings
+                expand_o : int = vocab_size 
+                retrieve_id : int = w2t[0]
 
-            if self.invert:
-                distances = 1 / distances
+                if len(w2t) > 1:
+                    expand_o = expand_o + 1
+                    i = torch.cat((word_i.unsqueeze(0), i), dim = 0)
+                    retrieve_id = 0
 
-            distances = torch.nn.functional.softmax(distances, dim = 0)
-            
-            distances = distances[0].unsqueeze(-1)
+                word_o = word_o.unsqueeze(0).expand(expand_o, *word_o.shape)
 
-            distances = self.linear(-torch.log(distances))
+                distance = self.distance(i, word_o)
 
-            preds.append(distances)
+                if self.invert:
+                    distance = 1 / distance
+                
+                distance = torch.nn.functional.softmax(distance, dim = 0)
+                
+                distance = distance[retrieve_id].unsqueeze(-1)
+                distances.append(distance)
+
+            distances_stack : torch.Tensor = torch.stack(distances)
+            distances_stack = self.linear(-torch.log(distances_stack))
+
+            preds.append(distances_stack)
 
         return preds
     
@@ -148,19 +178,7 @@ class GPTDistanceRegression():
         gpt_out_embeds : torch.Tensor
         gpt_in_embeds, gpt_out_embeds = generate_embeds(input_ids, self.gpt)
 
-        word_gpt_in : list[torch.Tensor] = []
-        word_gpt_out : list[torch.Tensor] = []
-        for sen_gpt_in, sen_gpt_out, sen_map in zip(gpt_in_embeds, gpt_out_embeds, batch.word2tokenidxs):
-            sen_word_gpt_in : list[torch.Tensor] = [sen_gpt_in[0]]
-            sen_word_gpt_out : list[torch.Tensor] = [sen_gpt_out[0]]
-            for word in sen_map:
-                sen_word_gpt_in.append(torch.mean(sen_gpt_in[word], dim = 0))
-                sen_word_gpt_out.append(torch.mean(sen_gpt_out[word], dim = 0))
-            
-            word_gpt_in.append(torch.stack(sen_word_gpt_in))
-            word_gpt_out.append(torch.stack(sen_word_gpt_out))
-
-        preds : list[torch.Tensor] = self.calculate_distances(word_gpt_in, word_gpt_out)
+        preds : list[torch.Tensor] = self.calculate_distances(gpt_in_embeds, gpt_out_embeds, batch.word2tokenidxs)
 
         # TODO: should we normalise against distance to all words?
 
