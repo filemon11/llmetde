@@ -41,6 +41,8 @@ class GPTDistanceRegression():
 
         self.optimiser : optim.SGD = optim.SGD(self.distance_regression.parameters(), **optimiser_params)
 
+        self.gpt.to(training_params["device"])
+        self.distance_regression.to(training_params["device"])
         self.training_params : dict = training_params
 
     def train(self, y_names : list[str],
